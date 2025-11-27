@@ -1,2 +1,12 @@
 fastapi
 uvicorn[standard]
+requests
+selenium
+pandas
+beautifulsoup4
+flask
+PyPDF2
+faster-whisper
+scipy
+sklearn
+Pillow

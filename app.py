@@ -1,1104 +1,1151 @@
-from github.GithubException import GithubException
 import os
+import re
+import sys
 import time
-import threading
-import logging
-from flask import Flask, request, jsonify
-from github import Github, UnknownObjectException
-import requests
 import json
-from google import genai
-import hashlib
+import logging
+import tempfile
+import subprocess
+import threading
 from queue import Queue
 
+from flask import Flask, request, jsonify
 
-# Set up logging
+import requests
+
+# =========================
+# CONFIG & LOGGING
+# =========================
+
+# Test config
+
 logging.basicConfig(
     format='[%(asctime)s][%(levelname)s] %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-GOOGLE_FORM_SECRET = os.getenv("GOOGLE_FORM_SECRET")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_USER = os.getenv("GITHUB_USER")
-AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GOOGLE_FORM_SECRET = os.environ.get("GOOGLE_FORM_SECRET", "your-secret")
+AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN")
 AIPIPE_URL = "https://aipipe.org/openrouter/v1/chat/completions"
-# PIPE = "GEMINI"
-PIPE = "OPENAI"
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", AIPIPE_TOKEN)  # Use OpenAI key if set, else fallback to AIPIPE
+
+MAX_CHAIN_SECONDS = 180
 
 app = Flask(__name__)
-gh = Github(GITHUB_TOKEN)
+task_queue = Queue(maxsize=16) 
 
 
-task_queue = Queue(maxsize=16)
+# =========================
+# DIRECT LLM SOLVER (Render page, pass to LLM, get answer)
+# =========================
 
-client = genai.Client()
-chat = client.chats.create(model="gemini-2.5-flash")
+def solve_quiz_with_llm(quiz_url, email, secret, error_context=None):
+    """
+    Render quiz page with Selenium, download data files, and ask LLM to solve directly.
+    Returns: {'submit_url': '...', 'answer': ...}
+    error_context: Optional error reason from previous incorrect attempt
+    """
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.support.ui import WebDriverWait
+    from bs4 import BeautifulSoup
+    from urllib.parse import urljoin
+    
+    driver = None
+    try:
+        # Step 1: Render page with Selenium
+        logger.info(f"Rendering quiz page with Selenium: {quiz_url}")
+        options = Options()
+        options.add_argument('--headless=new')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--window-size=1920,1080')
+        
+        driver = webdriver.Chrome(options=options)
+        driver.get(quiz_url)
+        
+        # Wait for page load and JS execution
+        WebDriverWait(driver, 20).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        time.sleep(4)  # Extra time for JS/base64 decoding
+        
+        # Get rendered HTML (base64 content is now decoded)
+        rendered_html = driver.page_source
+        soup = BeautifulSoup(rendered_html, 'html.parser')
+        
+        # Step 2: Extract data file URLs (including audio)
+        data_files = []
+        audio_files = []
+        
+        # Debug: log all links found
+        all_links = []
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            full_url = urljoin(quiz_url, href)
+            all_links.append(f"{a.get_text(strip=True)}: {full_url}")
+            
+            if any(ext in href.lower() for ext in ['.pdf', '.csv', '.json', '.txt']):
+                data_files.append(full_url)
+            elif any(ext in href.lower() for ext in ['.mp3', '.wav', '.m4a', '.ogg', '.flac', '.opus']):
+                audio_files.append(full_url)
+        
+        logger.info(f"All links found: {all_links}")
+        
+        # Also check for audio tags
+        audio_tags_found = soup.find_all('audio')
+        logger.info(f"Audio tags found: {len(audio_tags_found)}")
+        for audio_tag in audio_tags_found:
+            logger.info(f"Audio tag: {audio_tag}")
+            src = audio_tag.get('src')
+            if src:
+                audio_files.append(urljoin(quiz_url, src))
+        
+        logger.info(f"Found {len(data_files)} data files and {len(audio_files)} audio files to download")
+        
+        # Step 3: Download and process data files
+        file_contents = {}
+        MAX_PREVIEW_SIZE = 2 * 1024 * 1024  # 2MB limit for preview
 
+        for file_url in data_files:
+            try:
+                # Stream download to check size without loading full file
+                content_accumulated = b""
+                truncated = False
+                
+                with requests.get(file_url, stream=True, timeout=30) as r:
+                    if r.status_code == 200:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            content_accumulated += chunk
+                            if len(content_accumulated) > MAX_PREVIEW_SIZE:
+                                truncated = True
+                                break
+                        
+                        if truncated:
+                            file_contents[file_url] = f"[File too large (> {MAX_PREVIEW_SIZE} bytes) - Use Option 3 to process locally]"
+                            continue
+                        
+                        # Process small files
+                        if file_url.lower().endswith('.pdf'):
+                            # Extract PDF text
+                            from PyPDF2 import PdfReader
+                            import io
+                            try:
+                                reader = PdfReader(io.BytesIO(content_accumulated))
+                                text = ""
+                                for i, page in enumerate(reader.pages):
+                                    text += f"\n--- Page {i+1} ---\n"
+                                    text += page.extract_text() or ""
+                                file_contents[file_url] = text
+                            except Exception as pdf_err:
+                                file_contents[file_url] = f"[PDF parsing failed: {pdf_err}]"
+                        else:
+                            # Assume text/csv
+                            file_contents[file_url] = content_accumulated.decode('utf-8', errors='ignore')
+            except Exception as e:
+                logger.warning(f"Failed to download {file_url}: {e}")
+        
+        # Step 3.5: Download and transcribe audio files
+        audio_transcriptions = {}
+        for audio_url in audio_files:
+            try:
+                logger.info(f"Downloading audio file: {audio_url}")
+                audio_resp = requests.get(audio_url, timeout=60)
+                if audio_resp.status_code == 200:
+                    # Transcribe using hybrid approach (API first, local fallback)
+                    logger.info(f"Transcribing audio file...")
+                    
+                    # Determine file extension from URL
+                    import os
+                    from urllib.parse import urlparse
+                    parsed_url = urlparse(audio_url)
+                    file_ext = os.path.splitext(parsed_url.path)[1] or '.mp3'
+                    
+                    # Save audio to temp file with correct extension
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_audio:
+                        tmp_audio.write(audio_resp.content)
+                        tmp_audio_path = tmp_audio.name
+                    
+                    transcription = None
+                    
+                    # Use gpt-4o-audio-preview via AIPipe (supports audio input in JSON)
+                    try:
+                        # Use faster-whisper for local transcription
+                        logger.info("Transcribing audio locally with faster-whisper...")
+                        
+                        from faster_whisper import WhisperModel
+                        
+                        # Initialize model (downloaded on first run)
+                        # Use 'base' or 'small' for speed. 'int8' is faster on CPU.
+                        model_size = "base"
+                        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+                        
+                        segments, info = model.transcribe(tmp_audio_path, beam_size=5)
+                        
+                        logger.info(f"Detected language '{info.language}' with probability {info.language_probability}")
+                        
+                        transcription = ""
+                        for segment in segments:
+                            transcription += segment.text + " "
+                        
+                        transcription = transcription.strip()
+                        logger.info(f"Audio transcribed locally")
+                        logger.info(f"Transcription: {transcription[:200]}...")
+                        
+                        if transcription:
+                            audio_transcriptions[audio_url] = transcription
+                        
+                    except Exception as transcription_error:
+                        logger.error(f"Audio transcription failed: {transcription_error}")
+                    
+                    # Clean up temp file
+                    import os
+                    if os.path.exists(tmp_audio_path):
+                        os.unlink(tmp_audio_path)
+                        
+            except Exception as e:
+                logger.error(f"Failed to process audio {audio_url}: {e}")
+        
+        # Step 4: Prepare context for LLM
+        page_text = soup.get_text(separator='\n', strip=True)
+        
+        # Extract and parse hyperlinks with their content
+        hyperlinks = []
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            text = a.get_text(strip=True)
+            full_url = urljoin(quiz_url, href)
+            
+            # Try to fetch and preview the link content
+            link_preview = ""
+            try:
+                logger.info(f"Fetching hyperlink: {full_url}")
+                # Quick HEAD request to check content type
+                head_resp = requests.head(full_url, timeout=5, allow_redirects=True)
+                content_type = head_resp.headers.get('Content-Type', '').lower()
+                logger.info(f"Content-Type: {content_type}")
+                
+                if 'text/html' in content_type:
+                    # It's an HTML page - fetch and preview
+                    resp = requests.get(full_url, timeout=10)
+                    if resp.status_code == 200:
+                        link_soup = BeautifulSoup(resp.text, 'html.parser')
+                        link_text = link_soup.get_text(separator=' ', strip=True)
+                        # Show first 300 chars of content
+                        preview_text = link_text[:300] if len(link_text) > 300 else link_text
+                        logger.info(f"Preview text length: {len(preview_text)}, content: {preview_text[:100]}")
+                        link_preview = f"\n    Content preview: {preview_text}"
+                elif 'application/json' in content_type:
+                    link_preview = " [JSON endpoint]"
+                elif 'pdf' in content_type:
+                    link_preview = " [PDF file]"
+                elif 'csv' in content_type or 'text/csv' in content_type:
+                    link_preview = " [CSV file]"
+                else:
+                    link_preview = f" [{content_type}]"
+            except Exception as e:
+                # If we can't fetch, just note it
+                logger.warning(f"Failed to fetch hyperlink {full_url}: {e}")
+                link_preview = " [could not preview]"
+            
+            hyperlinks.append(f"  - {text}: {full_url}{link_preview}")
+        
+        hyperlinks_section = ""
+        if hyperlinks:
+            hyperlinks_section = "\n\nHYPERLINKS FOUND ON PAGE:\n" + "\n".join(hyperlinks)
+        
+        # Build file contents summary
+        files_summary = ""
+        for url, content in file_contents.items():
+            files_summary += f"\n\n=== FILE: {url} ===\n{content[:5000]}\n"  # Limit to 5000 chars per file
+        
+        # Add audio transcriptions
+        if audio_transcriptions:
+            files_summary += "\n\n=== AUDIO TRANSCRIPTIONS ===\n"
+            for url, transcription in audio_transcriptions.items():
+                files_summary += f"\n--- Audio from {url} ---\n{transcription}\n"
+        
+        # Step 5: Ask LLM to solve (hybrid mode)
+        error_section = ""
+        if error_context:
+            error_section = f"""
+**PREVIOUS ATTEMPT WAS INCORRECT**:
+Your previous answer was wrong. The server responded: "{error_context}"
+Please reconsider your approach and provide a corrected answer.
+
+"""
+        
+        prompt = f"""{error_section}You are solving a quiz. Follow this priority order:
+
+**PRIORITY 1 - TRY DIRECT SOLVING FIRST**:
+If the question is trivial or can be answered with the information on the page, solve it directly and return JSON.
+
+**PRIORITY 2 - SCRAPING** (if you need additional data from a webpage):
+If you need data from another webpage, use scraping mode.
+
+**PRIORITY 3 - WRITE PYTHON CODE** (ONLY for external data processing):
+Use this ONLY when you need to:
+- Process external files (CSV, PDF, Audio, images)
+- Download and analyze data files
+- Read instructions from external sources
+- Perform complex calculations on downloaded data
+
+DO NOT use code for simple tasks that can be solved directly.
+
+QUIZ PAGE:
+{page_text[:5000]}
+{hyperlinks_section}
+
+DATA PREVIEWS (Content & Transcriptions):
+{files_summary}
+
+DATA FILES (URLs):
+{json.dumps(data_files, indent=2)}
+
+AUDIO FILES (URLs):
+{json.dumps(audio_files, indent=2)}
+
+INSTRUCTIONS:
+
+**OPTION 1: Direct Solving** (Use this for simple/trivial questions)
+Return JSON:
+{{
+  "mode": "direct",
+  "submit_url": "https://...",
+  "answer": <computed answer>,
+  "reasoning": "brief explanation"
+}}
+
+**OPTION 2: Scraping Needed**
+Return JSON:
+{{
+  "mode": "scrape",
+  "scrape_url": "https://...",
+  "submit_url": "https://...",
+  "reasoning": "need to scrape data from this URL first"
+}}
+
+**OPTION 3: Write Python Code** (ONLY for external data processing)
+Write a Python script that downloads and processes external data.
+The script can either:
+   - Compute the answer and return: `{{"submit_url": "...", "answer": ...}}`
+   - Submit directly and print the server response (which may contain a next URL to continue)
+
+**IMPORTANT NOTES**:
+- Try OPTION 1 first for simple questions
+- Use OPTION 3 ONLY when there are actual CSV, PDF, Audio files or external data to process
+- If your code submits directly, the system will automatically continue to the next URL if provided in the response
+
+**EXPECTED TASKS**:
+- **Scraping**: Extract data from websites (use `selenium` or `requests`).
+- **API Sourcing**: Fetch data from APIs (use `requests`).
+- **Cleansing**: Clean text, data, or PDF content.
+- **Processing**: Transform data, transcribe audio (`faster_whisper`), or process images (resize, crop, compress via `PIL`).
+- **Analysis**: Filter, sort, aggregate, reshape, or apply statistical/ML models (`pandas`, `scipy`, `sklearn`).
+- **Visualization**: Generate charts/narratives (note: visualization libraries like matplotlib are NOT currently allowed, output text descriptions instead).
+
+**PDF PROCESSING GUIDELINES**:
+- Use `PyPDF2` for extracting text from PDFs
+- Parse extracted text with string manipulation or pandas to extract table data
+
+CRITICAL: 
+- **PYTHON VERSION**: Ensure all code is compatible with Python 3.12
+- Use OPTION 3 for ANY CSV, PDF, or Audio processing.
+- If writing code, output ONLY the code block (```python ... ```).
+- **IMPORTANT**: Always return the data output from the code block as JSON to stdout.
+- **IMPORTANT**: Convert all numpy/pandas types to native Python types (e.g., `int(result)`, `float(result)`) before printing JSON. `numpy.int64` is NOT JSON serializable.
+- **ALLOWED LIBRARIES**: You may ONLY use standard Python libraries (os, json, re, math, etc.) and the following pre-installed packages:
+  - `requests`
+  - `pandas`
+  - `beautifulsoup4` (bs4)
+  - `PyPDF2`
+  - `selenium`
+  - `faster_whisper`
+  - `flask`
+  - `fastapi`
+  - `uvicorn`
+  - `scipy`
+  - `sklearn`
+  - `numpy`
+  - `PIL` (Pillow)
+  DO NOT import any other third-party libraries unless they are dependencies of the above.
+"""
+        
+        headers = {
+            "Authorization": f"Bearer {AIPIPE_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "openai/gpt-4o-mini",  # Use better model for direct solving
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        
+        # Log the prompt for debugging
+        logger.info("=" * 80)
+        logger.info("PROMPT BEING SENT TO LLM:")
+        logger.info("=" * 80)
+        logger.info(prompt)
+        logger.info("=" * 80)
+        
+        logger.info("Asking LLM to solve quiz (hybrid mode)...")
+        llm_resp = requests.post(AIPIPE_URL, headers=headers, json=payload, timeout=90)
+        llm_resp.raise_for_status()
+        llm_data = llm_resp.json()
+        
+        content = llm_data["choices"][0]["message"]["content"].strip()
+        
+        # Check for Python code block
+        if "```python" in content or "import " in content:
+            logger.info("LLM generated Python code. Executing...")
+            
+            # Retry loop for script execution errors
+            max_retries = 3
+            for attempt in range(1, max_retries + 1):
+                logger.info(f"Script execution attempt {attempt}/{max_retries}")
+                
+                # Extract code
+                code = content
+                if "```python" in code:
+                    code = code.split("```python")[1].split("```")[0].strip()
+                elif "```" in code:
+                    code = code.split("```")[1].split("```")[0].strip()
+                
+                # Execute script
+                script_result = execute_hybrid_script(code, email, secret, quiz_url)
+                
+                # Check for execution error
+                if script_result.get('error'):
+                    error_msg = script_result['error']
+                    logger.warning(f"Script execution failed (attempt {attempt}): {error_msg}")
+                    
+                    if attempt < max_retries:
+                        # Re-prompt LLM with error to fix the code
+                        logger.info("Re-prompting LLM to fix the error...")
+                        error_prompt = f"""
+The Python script you generated encountered an error:
+
+ERROR:
+{error_msg}
+
+FAILING CODE:
+```python
+{code}
+```
+
+ORIGINAL QUIZ:
+{page_text[:3000]}
+
+Please fix the code to handle this error. Common issues:
+- HTML selectors might be wrong (check the actual page structure)
+- Data might be in a different format
+- API endpoints might have changed
+
+Generate the FIXED Python code (output ONLY the code block):
+"""
+                        
+                        retry_payload = {
+                            "model": "openai/gpt-4o-mini",
+                            "messages": [{"role": "user", "content": error_prompt}],
+                        }
+                        
+                        try:
+                            retry_resp = requests.post(AIPIPE_URL, headers=headers, json=retry_payload, timeout=90)
+                            retry_resp.raise_for_status()
+                            retry_data = retry_resp.json()
+                            content = retry_data["choices"][0]["message"]["content"].strip()
+                            logger.info("LLM provided fixed code, retrying...")
+                            continue  # Retry with new code
+                        except Exception as e:
+                            logger.error(f"Failed to get fixed code from LLM: {e}")
+                            break
+                    else:
+                        # Max retries reached
+                        logger.error(f"Script failed after {max_retries} attempts")
+                        return {
+                            'submit_url': None,
+                            'answer': None,
+                            'reasoning': f"Script execution failed after {max_retries} attempts: {error_msg}"
+                        }
+                else:
+                    # Success! Process the result
+                    if script_result.get('submit_url') and 'answer' in script_result:
+                        return {
+                            'submit_url': script_result.get('submit_url'),
+                            'answer': script_result.get('answer'),
+                            'reasoning': f'Solved via generated Python script (attempt {attempt})'
+                        }
+                    else:
+                        # Assume script submitted directly
+                        logger.info(f"Script output does not contain submit_url/answer. Assuming direct submission. Output: {script_result}")
+                        return {
+                            'submit_url': None,
+                            'answer': None,
+                            'reasoning': f"Script executed successfully (attempt {attempt}). Output: {script_result}",
+                            'direct_submission_response': script_result
+                        }
+
+        # Remove markdown code fences if present (for JSON)
+        if content.startswith("```"):
+            lines = content.split("\n")
+            content = "\n".join(lines[1:-1])
+        
+        result = json.loads(content)
+        mode = result.get('mode', 'direct')
+        
+        # Check if LLM needs to scrape additional data
+        if mode == 'scrape':
+            scrape_url = result.get('scrape_url')
+            logger.info(f"LLM identified scraping needed: {scrape_url}")
+            
+            if scrape_url:
+                # Fetch the scraping page with Selenium (in case it needs JS rendering)
+                scrape_driver = None
+                try:
+                    logger.info(f"Fetching scraping URL with Selenium: {scrape_url}")
+                    
+                    scrape_options = Options()
+                    scrape_options.add_argument('--headless=new')
+                    scrape_options.add_argument('--disable-gpu')
+                    scrape_options.add_argument('--no-sandbox')
+                    
+                    scrape_driver = webdriver.Chrome(options=scrape_options)
+                    scrape_driver.get(scrape_url)
+                    
+                    # Wait for page load
+                    WebDriverWait(scrape_driver, 10).until(
+                        lambda d: d.execute_script("return document.readyState") == "complete"
+                    )
+                    time.sleep(2)  # Extra time for JS
+                    
+                    # Get rendered content
+                    scrape_html = scrape_driver.page_source
+                    scrape_soup = BeautifulSoup(scrape_html, 'html.parser')
+                    scraped_text = scrape_soup.get_text(separator='\n', strip=True)
+                    
+                    logger.info(f"Scraped content length: {len(scraped_text)} chars")
+                    logger.info(f"Scraped content preview: {scraped_text[:200]}")
+                    
+                    if len(scraped_text) == 0:
+                        logger.warning("Scraped content is empty!")
+                    
+                    # Re-prompt LLM with the scraped content
+                    reprompt = f"""
+You previously identified that you need to scrape data from: {scrape_url}
+
+Here is the scraped content:
+
+SCRAPED PAGE:
+{scraped_text[:5000]}
+
+ORIGINAL QUIZ PAGE:
+{page_text[:5000]}
+
+Now compute the answer based on the scraped data.
+
+CRITICAL OUTPUT REQUIREMENTS:
+1. Return ONLY valid JSON - no markdown, no code fences, no explanations
+2. Do NOT include comments (no // or /* */)
+3. Use this exact format:
+
+{{"submit_url":"{result.get('submit_url', '')}", "answer":"your_computed_answer", "reasoning":"brief explanation"}}
+
+Replace "your_computed_answer" with the actual answer you computed from the scraped data.
+Output ONLY the JSON object, nothing else.
+"""
+                    
+                    logger.info("Re-prompting LLM with scraped content...")
+                    reprompt_payload = {
+                        "model": "openai/gpt-4o-mini",
+                        "messages": [{"role": "user", "content": reprompt}],
+                    }
+                    
+                    llm_resp2 = requests.post(AIPIPE_URL, headers=headers, json=reprompt_payload, timeout=90)
+                    llm_resp2.raise_for_status()
+                    llm_data2 = llm_resp2.json()
+                    
+                    content2 = llm_data2["choices"][0]["message"]["content"].strip()
+                    
+                    logger.info("=" * 80)
+                    logger.info("LLM RESPONSE TO RE-PROMPT:")
+                    logger.info("=" * 80)
+                    logger.info(content2)
+                    logger.info("=" * 80)
+                    
+                    # Extract JSON from response (minimal cleanup)
+                    # Remove markdown code fences if present
+                    if "```json" in content2:
+                        content2 = content2.split("```json")[1].split("```")[0].strip()
+                    elif content2.startswith("```"):
+                        lines2 = content2.split("\n")
+                        content2 = "\n".join(lines2[1:-1]).strip()
+                    
+                    # Find JSON object if there's extra text
+                    start_idx = content2.find('{')
+                    end_idx = content2.rfind('}')
+                    if start_idx != -1 and end_idx != -1:
+                        json_str = content2[start_idx:end_idx+1]
+                    else:
+                        json_str = content2
+                    
+                    logger.info(f"Extracted JSON: {json_str[:300]}")
+                    
+                    try:
+                        result = json.loads(json_str)
+                        logger.info("LLM solved with scraped data")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Failed to parse LLM response as JSON: {e}")
+                        logger.error(f"Full response was: {content2[:500]}")
+                        return {"submit_url": None, "answer": None, "reasoning": f"JSON parse error: {e}"}
+                    
+                except Exception as e:
+                    logger.error(f"Failed to scrape or re-prompt: {e}")
+                    return {"submit_url": None, "answer": None, "reasoning": f"Scraping failed: {e}"}
+                finally:
+                    if scrape_driver:
+                        try:
+                            scrape_driver.quit()
+                        except:
+                            pass
+        else:
+            logger.info("LLM solved directly")
+        
+        # Handle relative submit URLs (e.g., "/submit" -> "https://domain.com/submit")
+        submit_url = result.get('submit_url')
+        if submit_url and not submit_url.startswith('http'):
+            from urllib.parse import urljoin
+            submit_url = urljoin(quiz_url, submit_url)
+            result['submit_url'] = submit_url
+            logger.info(f"Converted relative URL to absolute: {submit_url}")
+        
+        logger.info(f"Solution: submit_url={result.get('submit_url')}, answer={result.get('answer')}, mode={mode}")
+        
+        return {
+            'submit_url': result.get('submit_url'),
+            'answer': result.get('answer'),
+            'reasoning': result.get('reasoning', '')
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to solve quiz with LLM: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            'submit_url': None,
+            'answer': None,
+            'reasoning': f'Error: {e}'
+        }
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except:
+                pass
+
+
+# =========================
+# HYBRID SCRIPT EXECUTION
+# =========================
+
+def execute_hybrid_script(script_code, email, secret, quiz_url, timeout_seconds=60):
+    """
+    Execute LLM-generated script with injected variables.
+    The script has access to: email, secret, quiz_url, AIPIPE_TOKEN
+    """
+    try:
+        # Inject variables at the top of the script
+        injected_script = f"""
+import os
+import sys
+import json
+
+# Injected variables
+os.environ['AIPIPE_TOKEN'] = {json.dumps(AIPIPE_TOKEN)}
+email = {json.dumps(email)}
+secret = {json.dumps(secret)}
+quiz_url = {json.dumps(quiz_url)}
+
+# LLM-generated code starts here
+{script_code}
+"""
+        
+        logger.info("Executing hybrid script...")
+        logger.info(f"Script length: {len(injected_script)} chars")
+        
+        # Save script for debugging
+        with open("generated_solver_temp.py", "w") as f:
+            f.write(injected_script)
+        
+        # Execute script and capture output
+        result = subprocess.run(
+            [sys.executable, "-c", injected_script],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds
+        )
+        
+        if result.returncode != 0:
+            error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+            logger.error(f"Script execution failed: {error_msg}")
+            return {"error": error_msg, "submit_url": None, "answer": None}
+        
+        # Parse JSON output from script
+        output = result.stdout.strip()
+        logger.info(f"Script output: {output[:500]}")
+        
+        # Try to parse the output directly as JSON first
+        try:
+            result_json = json.loads(output)
+            logger.info("Successfully parsed output as JSON")
+            return result_json
+        except json.JSONDecodeError:
+            logger.info("Output is not pure JSON, looking for JSON pattern...")
+        
+        # Find JSON in output (might have other print statements)
+        # Look for the last JSON object in the output
+        json_match = None
+        json_matches = list(re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', output))
+        if json_matches:
+            # Try the last match first (most likely the final result)
+            json_match = json_matches[-1]
+            matched_str = json_match.group(0)
+            
+            # Try JSON first
+            try:
+                result_json = json.loads(matched_str)
+                logger.info("Successfully parsed JSON from pattern match")
+                return result_json
+            except json.JSONDecodeError:
+                # Fallback: try ast.literal_eval for Python dict format
+                import ast
+                try:
+                    result_json = ast.literal_eval(matched_str)
+                    if isinstance(result_json, dict):
+                        logger.info("Successfully parsed output using ast.literal_eval")
+                        return result_json
+                except Exception as e:
+                    logger.warning(f"ast.literal_eval also failed: {e}")
+        
+        logger.error(f"No valid JSON found in script output: {output[:200]}")
+        return {"submit_url": None, "answer": None}
+            
+    except subprocess.TimeoutExpired:
+        logger.error(f"Script execution timed out after {timeout_seconds}s")
+        return {"submit_url": None, "answer": None}
+    except Exception as e:
+        logger.error(f"Script execution error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"submit_url": None, "answer": None}
+
+
+# =========================
+# LLM: GENERATE SOLVER SCRIPT (DEPRECATED - keeping for reference)
+# =========================
+
+def generate_solver_script(email, secret, quiz_url, question=None, submit_url=None, attachments=None, max_retries=3):
+    """
+    DEPRECATED: This function generates a Python script for solving quizzes.
+    Now using solve_quiz_with_llm() for direct solving instead.
+    """
+    
+    prompt = f"""
+Write a Python 3 script to solve this quiz question.
+
+GIVEN INFORMATION (already extracted):
+email = {json.dumps(email)}
+secret = {json.dumps(secret)}
+quiz_url = {json.dumps(quiz_url)}
+submit_url = {json.dumps(submit_url or "UNKNOWN")}
+
+QUESTION:
+{question or "No question extracted - check page content"}
+
+DATA FILES TO PROCESS:
+{attachments_str or "None"}
+
+YOUR TASK:
+1. Download and process the data files listed above
+   - PDFs: Use PyPDF2.PdfReader to extract text from each page
+   - CSVs: Use pandas.read_csv() to load data
+   - Store data for analysis
+
+2. Read the QUESTION carefully and compute the correct answer
+   - Pay attention to specific instructions (e.g., "3rd number" = index [2])
+   - For column operations: df['column_name'].sum() or .max()
+   - For PDF pages: Remember 0-indexing (page 2 = index 1)
+   - Filter BEFORE aggregating if needed
+
+3. Output JSON to stdout:
+   {{"submit_url": submit_url, "payload": {{"email": email, "secret": secret, "url": quiz_url, "answer": ANSWER}}}}
+
+IMPORTANT:
+- If submit_url is "UNKNOWN", try to find it by checking the quiz page or use a fallback
+- Return int if answer should be an integer (use int() if needed)
+- Print ONLY the JSON output to stdout, log debug info to stderr
+- No markdown, no code fences, just valid Python code
+
+Required imports:
+import sys, json, io, requests
+from PyPDF2 import PdfReader
+import pandas as pd
+
+Output ONLY valid Python code.
+"""
+    
+    headers = {
+        "Authorization": f"Bearer {AIPIPE_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "openai/gpt-5-nano",
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"Calling AIPipe to generate solver script (attempt {attempt})")
+            resp = requests.post(AIPIPE_URL, headers=headers, json=payload, timeout=120)
+            resp.raise_for_status()
+            data = resp.json()
+            code = data["choices"][0]["message"]["content"]
+            for marker in ("``````", "`"):
+                code = code.replace(marker, "")
+            code = code.strip()
+            logger.info(f"Generated solver script, length={len(code)} chars")
+            return code
+        except Exception as e:
+            logger.error(f"AIPipe error: {e}")
+            if attempt == max_retries:
+                raise
+            time.sleep(3)
+
+
+# =========================
+# RUN GENERATED SCRIPT (MODIFIED: NO DELETION)
+# =========================
+
+def run_solver_script(code, timeout_seconds):
+    """
+    Run generated code as a script using a fixed local file.
+    The file is NOT deleted after execution for debugging.
+    Expect final stdout line to be JSON: {"submit_url": "...", "payload": {...}}
+    """
+    # Use a fixed file path in the current directory
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    script_path = os.path.join(base_dir, "generated_solver_temp.py")
+    
+    try:
+        # Write the code to the fixed local file
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(code)
+        logger.info(f"Saved generated solver script to {script_path}")
+    except Exception as e:
+        logger.error(f"Failed to save generated script to {script_path}: {e}")
+        return None
+
+    logger.info(f"Executing solver script {script_path} with timeout={timeout_seconds}s")
+    start = time.time()
+    try:
+        proc = subprocess.run(
+            ["python", script_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        elapsed = time.time() - start
+        logger.info(f"Solver exited code={proc.returncode} in {elapsed:.1f}s")
+        if proc.stderr:
+            logger.debug(f"Solver STDERR:\n{proc.stderr}")
+
+        lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+        if not lines:
+            logger.warning("Solver produced no stdout lines")
+            return None
+
+        last = lines[-1]
+        try:
+            result = json.loads(last)
+            if "submit_url" in result and "payload" in result:
+                return result
+            logger.warning("Solver JSON missing required keys")
+            return None
+        except json.JSONDecodeError:
+            logger.warning("Last stdout line is not valid JSON")
+            return None
+    except subprocess.TimeoutExpired:
+        logger.error("Solver script timed out")
+        return None
+    finally:
+        # --- MODIFICATION: File deletion is REMOVED ---
+        # The script file at script_path will remain for debugging.
+        pass
+
+
+# =========================
+# QUIZ CHAIN LOGIC (Executed by worker)
+# =========================
+
+def solve_quiz_chain(email, secret, start_url):
+    """
+    Background chain logic to solve quizzes sequentially using direct LLM solving.
+    """
+    logger.info(f"Starting quiz chain for {email} at {start_url}")
+    start_time = time.time()
+    current_url = start_url
+    results = []
+
+    while current_url and (time.time() - start_time) < MAX_CHAIN_SECONDS:
+        logger.info(f"Solving quiz at {current_url}")
+        chain_elapsed = time.time() - start_time
+        time_left = MAX_CHAIN_SECONDS - chain_elapsed
+        if time_left <= 15:
+            logger.warning("Not enough time remaining for another full solve")
+            break
+
+        try:
+            # Use direct LLM solving (renders page, downloads files, computes answer)
+            logger.info("Solving quiz with LLM...")
+            solution = solve_quiz_with_llm(current_url, email, secret)
+            
+            if not solution or (not solution.get('submit_url') and not solution.get('direct_submission_response')):
+                logger.error("LLM failed to find submit URL and no direct submission occurred")
+                results.append({"url": current_url, "error": "no_submit_url_found"})
+                break
+            
+            submit_url = solution['submit_url']
+            answer = solution['answer']
+            
+            logger.info(f"LLM solution: submit_url={submit_url}, answer={answer}")
+            
+        except Exception as e:
+            logger.error(f"Quiz solving failed: {e}")
+            results.append({"url": current_url, "error": f"solving_failed: {e}"})
+            break
+
+
+        # Step 3: Submit answer and retry on incorrect responses
+        max_answer_retries = 3
+        for retry_attempt in range(1, max_answer_retries + 1):
+            logger.info(f"Answer submission attempt {retry_attempt}/{max_answer_retries}")
+            
+            submit_url = solution.get('submit_url')
+            answer = solution.get('answer')
+            direct_response = solution.get('direct_submission_response')
+            
+            if direct_response:
+                logger.info("Using direct submission response from script.")
+                data = direct_response
+            elif submit_url and answer is not None:
+                logger.info(f"Submitting answer to {submit_url}: {answer}")
+                try:
+                    payload = {
+                        "email": email,
+                        "secret": secret,
+                        "url": current_url,
+                        "answer": answer
+                    }
+                    resp = requests.post(submit_url, json=payload, timeout=15)
+                    resp.raise_for_status()
+                    
+                    # Check if response is empty or invalid
+                    if not resp.text or not resp.text.strip():
+                        logger.error("Submission returned empty response - cannot continue")
+                        results.append({"url": current_url, "error": "empty_response_from_server"})
+                        # Break from both retry loop and outer while loop
+                        current_url = None
+                        break
+                    
+                    try:
+                        data = resp.json()
+                    except json.JSONDecodeError as json_err:
+                        logger.error(f"Submission returned invalid JSON: {json_err}")
+                        results.append({"url": current_url, "error": f"invalid_json_response: {json_err}"})
+                        # Break from both retry loop and outer while loop
+                        current_url = None
+                        break
+                except requests.exceptions.Timeout:
+                    logger.warning(f"Submission timed out after 15 seconds (attempt {retry_attempt}/{max_answer_retries})")
+                    if retry_attempt < max_answer_retries:
+                        logger.info("Retrying after timeout...")
+                        continue  # Retry with same solution
+                    else:
+                        logger.error(f"Submission timed out after {max_answer_retries} attempts")
+                        results.append({"url": current_url, "error": "submission_timeout"})
+                        break
+                except Exception as e:
+                    logger.error(f"Submission failed: {e}")
+                    results.append({"url": current_url, "error": f"submission_failed: {e}"})
+                    break
+            else:
+                logger.error("LLM failed to find submit URL or answer, and no direct submission detected.")
+                results.append({"url": current_url, "error": "no_submit_url_found"})
+                break
+
+            correct = data.get("correct")
+            next_url = data.get("url")
+            reason = data.get("reason", "")
+            
+            # Normalize correct to boolean (handle both string and boolean)
+            if isinstance(correct, str):
+                correct = correct.lower() in ("true", "1", "yes")
+            
+            # Check if answer is correct
+            if correct is True:
+                logger.info(f"Answer is correct on attempt {retry_attempt}")
+                results.append({
+                    "url": current_url,
+                    "answer": answer,
+                    "correct": correct,
+                    "reason": reason,
+                    "reasoning": solution.get('reasoning', ''),
+                    "attempts": retry_attempt
+                })
+                
+                # Check if next_url is different from current_url
+                if next_url and next_url != current_url:
+                    current_url = next_url
+                else:
+                    if next_url == current_url:
+                        logger.info("Quiz complete - next URL is same as current URL.")
+                    else:
+                        logger.info("Quiz chain complete (no next URL).")
+                    current_url = None  # Signal outer loop to stop
+                break  # Exit retry loop
+            elif correct is False:
+                logger.warning(f"Answer is incorrect on attempt {retry_attempt}. Reason: {reason}")
+                
+                if retry_attempt < max_answer_retries:
+                    # Re-prompt LLM with error feedback
+                    logger.info("Re-prompting LLM with error feedback...")
+                    try:
+                        retry_solution = solve_quiz_with_llm(current_url, email, secret, error_context=reason)
+                        if retry_solution:
+                            solution = retry_solution
+                            continue  # Retry with new solution
+                    except Exception as e:
+                        logger.error(f"Failed to get retry solution: {e}")
+                        break
+                else:
+                    # Max retries reached
+                    logger.error(f"Answer still incorrect after {max_answer_retries} attempts")
+                    results.append({
+                        "url": current_url,
+                        "answer": answer,
+                        "correct": False,
+                        "reason": reason,
+                        "reasoning": solution.get('reasoning', ''),
+                        "attempts": max_answer_retries
+                    })
+                    
+                    # Continue to next URL if available
+                    if next_url:
+                        logger.info(f"Moving to next quiz despite incorrect answer: {next_url}")
+                        current_url = next_url
+                    else:
+                        logger.info("No next URL available. Quiz chain complete.")
+                    break  # Exit retry loop
+            else:
+                # correct is None - response doesn't have 'correct' field
+                logger.error(f"Response missing 'correct' field. Data: {data}")
+                results.append({
+                    "url": current_url,
+                    "error": "invalid_response_format",
+                    "data": data
+                })
+                break  # Exit both loops
+        else:
+            # Loop completed without break (shouldn't happen, but handle it)
+            logger.info("Quiz chain complete or dead end.")
+            break
+    
+    logger.info(f"Quiz chain completed for {email}. Processed {len(results)} quiz question(s). Final results: {results}")
+
+
+# =========================
+# BACKGROUND WORKERS
+# =========================
 
 def worker():
+    """Background worker that processes tasks from queue."""
     while True:
         req = task_queue.get()
         try:
-            # Your existing function (already handles retries)
-            process_request(req)
+            logger.info(f"Background worker picked task for email={req.get('email')}")
+            solve_quiz_chain(
+                email=req["email"],
+                secret=req["secret"],
+                start_url=req["url"],
+            )
         except Exception as e:
-            logger.error(f"Background worker error: {e}")
+            logger.error(f"Background worker error: {e}", exc_info=True)
         finally:
             task_queue.task_done()
 
-
-for _ in range(2):  # Tune this number for your quota/environment
-    t = threading.Thread(target=worker)
-    t.daemon = True
+# Start background workers (e.g., 2 workers)
+for _ in range(2):
+    t = threading.Thread(target=worker, daemon=True)
     t.start()
 
 
-def upsert_github_file(repo, path, content, commit_msg, branch="main"):
-    """
-    Upserts a file to a specific path in a GitHub repository on a given branch.
+# =========================
+# FLASK ENDPOINTS (ASYNC RESPONSE)
+# =========================
 
-    Args:
-        repo: PyGithub Repository object.
-        path (str): The full path to the file in the repo.
-        content (str): The content to write to the file.
-        commit_msg (str): The commit message.
-        branch (str): The name of the branch to commit to. Defaults to "main".
+@app.route("/quiz", methods=["POST"])
+def handle_quiz():
     """
+    Accept quiz request and queue it for background processing.
+    Returns immediately with acknowledgment (200).
+    """
+    logger.info("API /quiz called.")
     try:
-        # Get the file to see if it exists on the specified branch
-        file = repo.get_contents(path, ref=branch)
-
-        # If it exists, update it
-        result = repo.update_file(
-            path=file.path,
-            message=commit_msg,
-            content=content,
-            sha=file.sha,
-            branch=branch
-        )
-        print(f"Updated '{path}' on branch '{branch}'.")
-        return result
-
-    except GithubException as e:
-        if e.status == 404:
-            # If the file does not exist, create it
-            result = repo.create_file(
-                path=path,
-                message=commit_msg,
-                content=content,
-                branch=branch
-            )
-            print(f"Created '{path}' on branch '{branch}'.")
-            return result
-
-        else:
-            # Re-raise other exceptions
-            print(f"Encountered an unexpected error: {e}")
-            return None
-
-
-def get_repo_name_from_task(task):
-    """Creates a stable and predictable repository name from a task ID."""
-    # Hash ONLY the stable task_id to get a unique fingerprint
-    sha1 = hashlib.sha1(task.encode('utf-8')).hexdigest()
-    short_hash = sha1[:8]
-
-    return f"{task}-{short_hash}"
-
-
-def llm_generate_file(prompt):
-    max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
-        try:
-            if PIPE == "GEMINI":
-                logger.info(f"Calling LLM for file generation with {PIPE}")
-                response = chat.send_message(prompt)
-                output = response.text
-                return output
-            else:
-                logger.info(
-                    f"Calling LLM for file generation... [Attempt {attempt}]")
-                headers = {
-                    "Authorization": f"Bearer {AIPIPE_TOKEN}",
-                    "Content-Type": "application/json"
-                }
-                payload = {
-                    "model": "openai/gpt-5-nano",
-                    "messages": [{"role": "user", "content": prompt}]
-                }
-
-                resp = requests.post(
-                    AIPIPE_URL, headers=headers, json=payload, timeout=120
-                )
-                resp.raise_for_status()  # Raise exception for bad status codes
-                logger.info(
-                    f"Received response from LLM. Status: {resp.status_code}")
-                logger.debug(f"Raw response: {resp.text[:200]}...")
-
-                response_json = resp.json()
-                output = response_json["choices"][0]["message"]["content"]
-                return output
-
-        except requests.exceptions.JSONDecodeError as e:
-            logger.error(f"JSON decode error: {e}")
-            if 'resp' in locals():
-                logger.error(f"Response text: {resp.text[:500]}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed: {e}")
-
-        if attempt < max_attempts:
-            logger.warning(
-                f"LLM API failed, retrying in 5 seconds... (Attempt {attempt+1} of {max_attempts})")
-            time.sleep(5)  # Wait before retrying
-        else:
-            logger.error("LLM API failed after maximum retries.")
-            raise Exception("LLM API failed after 3 attempts.")
-
-
-def llm_generate_file2(prompt):
-    if PIPE == "GEMINI":
-        logger.info(f"Calling LLM for file generation with {PIPE}")
-        response = chat.send_message(prompt)
-        output = response.text
-    else:
-        logger.info("Calling LLM for file generation...")
-        headers = {"Authorization": f"Bearer {AIPIPE_TOKEN}",
-                   "Content-Type": "application/json"}
-        payload = {"model": "openai/gpt-5-nano",
-                   "messages": [{"role": "user", "content": prompt}]}
-
-        try:
-            resp = requests.post(AIPIPE_URL, headers=headers,
-                                 json=payload, timeout=120)
-            resp.raise_for_status()  # Raise exception for bad status codes
-            logger.info(
-                f"Received response from LLM. Status: {resp.status_code}")
-
-            # Log the raw response for debugging
-            logger.debug(f"Raw response: {resp.text[:200]}...")
-
-            response_json = resp.json()
-            output = response_json["choices"][0]["message"]["content"]
-
-        except requests.exceptions.JSONDecodeError as e:
-            logger.error(f"JSON decode error: {e}")
-            logger.error(f"Response text: {resp.text[:500]}")
-            raise Exception(
-                f"Invalid JSON response from LLM API: {resp.text[:200]}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed: {e}")
-            raise
-        except KeyError as e:
-            logger.error(f"Unexpected response structure: {e}")
-            logger.error(f"Response JSON: {response_json}")
-            raise Exception(f"Unexpected API response format: missing {e}")
-
-    return output
-
-
-def generate_code(brief, app_code, attachments=None, round_num=1, checks=None, output_dir="output"):
-    """
-    Constructs a prompt for generating a Flask app that can run as a server
-    OR export static files for GitHub Pages deployment.
-    """
-    attachments = attachments or []
-    checks = checks or []
-
-    checks_section = "\n".join(
-        f"- {chk}" for chk in checks) or "- None specified."
-    att_preview = "\n".join(
-        f"- {att['name']} (Preview: {att['url'][:64]}...)"
-        for att in attachments
-    ) or "- None"
-
-    sample_data_json = (
-        '{\n'
-        '  "attachments": [\n'
-        '    { "name": "sample.png", "url": "data:image/png;base64,iVBORw..." }\n'
-        '  ]\n'
-        '}'
-    )
-
-    # prompt = (
-    #     "TASK: Build an app (app.py) based on the brief and functional checks below.\n"
-    #     "By default, generate a minimal and generic Python app.\n"
-    #     "If ANY requirement, check, or brief context specifically mentions/requires 'Flask', the app MUST use Flask and follow all Flask usage conventions (setup, routing, server, context, etc.).\n"
-    #     "App must visually and functionally demonstrate every condition in the brief/checks in its static export (if required).\n"
-
-    #     "--BRIEF--\n"
-    #     f"{brief}\n\n"
-
-    #     "--- FUNCTIONAL REQUIREMENTS ---\n"
-    #     f"{checks_section}\n"
-    #     "Exclude any requirements/checks related to README or repository setup.\n"
-    #     "Ensure all imports required for the app are included.\n\n"
-
-    #     "--- ATTACHMENT HANDLING ---\n"
-    #     "At runtime, app must load attachments from repo root data.json, which has this format:\n"
-    #     f"{sample_data_json}\n"
-    #     f"Attachments to process:\n{att_preview}\n\n"
-
-    #     "--- DUAL MODE OPERATION ---\n"
-    #     "Your app must support two modes:\n"
-    #     "1. Development: Run 'python app.py' to start a Flask server on any standard port, serving pages dynamically.\n"
-    #     f"2. Static Export: Run 'python app.py --export' to generate all pages as static HTML files in '{output_dir}/', including assets and decoded files.\n"
-    #     "    - Export all required assets (CSS, JS, images, decoded attachments) so links work offline.\n"
-    #     "    - Establish an application context to run the function if flask is the backend\n"
-    #     "    - No user interaction is required; script completes after export.\n\n"
-
-    #     "--- SPECIFIC INSTRUCTIONS ---\n"
-    #     "1. Parse data.json to extract and decode all Data URIs.\n"
-    #     "2. Use attachments as required by BRIEF context.\n"
-    #     "3. Do NOT hardcode example data; always load from data.json.\n"
-    #     "4. In export mode, save all decoded binary/static files (images, etc.) to output_dir.\n"
-    #     "5. Ensure all relative links and references work in the exported static site.\n"
-    #     "6. Export CSS either inline or as separate file to output_dir, as needed for proper rendering.\n"
-    #     "7. All exported files must reside in output_dir and be referenced correctly from HTML pages.\n"
-    #     "8. The exported site must be fully self-contained and ready for GitHub Pages.\n\n"
-    #     "9. Ensure rendering github pages strictly follows FUNCTIONAL REQUIREMENTS around pages, layout, content, and features.\n"
-    #     "10. When writing any HTML, CSS, or JavaScript strings that use .format() in Python, always use double curly braces ({{ }}) for all curly braces that do not represent format placeholders. This is required for correct string formatting and to avoid runtime KeyError or ValueError.\n"
-    #     "11. **Important** : Ensure rendering github pages strictly follows FUNCTIONAL REQUIREMENTS around pages, layout, content, and features. Also, no redirects or embedded links to access app from github pages are allowed.\n"
-
-    #     "--- OUTPUT REQUIREMENT ---\n"
-    #     "Output ONLY the code for app.py. Do NOT use markdown, code fences, sample input/output, or external explanations."
-    # )
-    # if round_num == 1:
-    #     prompt = (
-    #         "TASK: Build app.py based on the BRIEF and FUNCTIONAL REQUIREMENTS below.\n"
-    #         "By default, produce a minimal, generic Python app.\n"
-    #         "If ANY requirement, check, or brief context explicitly mentions or requires 'Flask', you MUST use Flask and rigorously follow Flask conventions (setup, routing, context, dynamic server, etc.).\n"
-    #         "The exported static site must visually and functionally demonstrate EVERY condition in the brief and functional checks—no hidden logic. All outputs must be directly observable.\n\n"
-
-    #         "--BRIEF--\n"
-    #         f"{brief}\n\n"
-
-    #         "--- FUNCTIONAL REQUIREMENTS (ALL MUST BE REFLECTED IN OUTPUT) ---\n"
-    #         f"{checks_section}\n"
-    #         "Exclude any README or repository setup requirements.\n"
-    #         "Include all required imports for the app’s code.\n\n"
-
-    #         "--- ATTACHMENT HANDLING ---\n"
-    #         "At runtime, load attachments from data.json in the repo root, using this format:\n"
-    #         f"{sample_data_json}\n"
-    #         f"Attachments to process:\n{att_preview}\n\n"
-
-    #         "--- MODES OF OPERATION ---\n"
-    #         "Support BOTH modes:\n"
-    #         "1. Development: 'python app.py' starts a Flask (if required) server on any standard port, serving pages dynamically.\n"
-    #         f"2. Static Export: 'python app.py --export' generates all site pages, assets, decoded attachment files, CSS/JS/images, etc., into '{output_dir}/' so links work offline. No user interaction—script exits after export.\n"
-    #         "    - If Flask is used, correctly handle application context during export.\n\n"
-
-    #         "--- SPECIFIC INSTRUCTIONS ---\n"
-    #         "1. Parse data.json to extract and decode all Data URIs. Do NOT hardcode attachments or sample data.\n"
-    #         "2. Use attachments exactly as required by the BRIEF and functional checks.\n"
-    #         "3. In export mode, save ALL binary/static files to output_dir. Ensure HTML, images, scripts, and CSS are properly linked for the static site.\n"
-    #         "4. Export CSS either inline or as separate file to output_dir as needed for correct rendering.\n"
-    #         "5. All exported files (HTML, CSS, attachments) must reside in output_dir and be referenced correctly in the HTML.\n"
-    #         "6. Exported site must be fully self-contained, directly validating every functional requirement—no redirects, no external links required for complete inspection.\n"
-    #         "7. All code must use standard Python 3 indentation (4 spaces per level, no tabs), be free of indentation or syntax errors, and be ready to run without modification.\n\n"
-    #         "8. **Important:** Static GitHub Pages output must strictly follow FUNCTIONAL REQUIREMENTS for layout, content, pages, and features.\n"
-    #         "9. When generating any Python string containing HTML, CSS, or JS for use with .format(), always escape literal curly braces with double braces ({{ }}) except for variable placeholders. This prevents KeyError and ensures correct formatting.\n"
-    #         "10. Never include links or redirects that require navigation outside the exported static site to access app features in GitHub Pages.\n"
-    #         "11. All code must use standard Python 3 indentation (4 spaces per level, no tabs), be free of indentation or syntax errors, and be ready to run without modification.\n\n"
-
-    #         "--- OUTPUT REQUIREMENT ---\n"
-    #         "Output ONLY the complete code for app.py. No markdown, code fences, sample input/output, comments outside code, or explanations."
-    #     )
-    # else:
-    #     prompt = (
-    #         "TASK: Update ONLY the feature logic in app.py below according to the revised brief and functional checks for round 2.\n"
-    #         "Keep all other code, structure, attachments/data.json handling, export/static/dual-mode routines, and file naming exactly as-is.\n"
-    #         "You may ONLY change or add code necessary to fulfill the new logic/routes/output as described.\n"
-    #         "Do NOT modify headers, comments, initialization, dual-mode switches, export routines, or static file patterns except as required by the new brief and checks.\n"
-    #         "If using Flask, keep all existing routing/app setup and modify only route logic as needed.\n"
-    #         "Preserve all import statements, file IO, and static export patterns unless feature logic demands otherwise.\n"
-
-    #         "--ROUND 2 BRIEF--\n"
-    #         f"{brief}\n\n"
-
-    #         "--- UPDATED FUNCTIONAL REQUIREMENTS ---\n"
-    #         f"{checks_section}\n"
-    #         "All new requirements must be reflected in app logic, view output, or site content as relevant.\n"
-    #         "Preserve dependencies, attachment decoding, and dual-mode support from the previous version.\n\n"
-    #         "All code must use standard Python 3 indentation (4 spaces per level, no tabs), be free of indentation or syntax errors, and be ready to run without modification.\n\n"
-
-    #         "--PREVIOUS APP.PY CODE (START)--\n"
-    #         f"{app_code}\n"
-    #         "--PREVIOUS APP.PY CODE (END)--\n\n"
-
-    #         "--- OUTPUT REQUIREMENT ---\n"
-    #         "Output ONLY the new, full code for app.py (with the core logic updated for round 2 as above, everything else untouched). Do NOT include markdown, code fences, or explanations."
-    #     )
-
-    if round_num == 1:
-        prompt = (
-            "TASK: Build app.py based on the BRIEF and FUNCTIONAL REQUIREMENTS below.\n"
-            "By default, create a minimal, generic Python app.\n"
-            "If ANY requirement, check, or brief context explicitly mentions or requires 'Flask', rigorously use Flask with correct conventions (setup, routing, context, dynamic server, etc.).\n"
-            "Exported static site must visually and functionally demonstrate EVERY condition in the brief and functional checks—no hidden logic, everything directly observable for inspection.\n"
-            "All code must be syntactically and indentation-correct Python 3 ready-to-run code (4 spaces per level, no tabs).\n\n"
-            "--BRIEF--\n"
-            f"{brief}\n\n"
-            "--- FUNCTIONAL REQUIREMENTS (ALL MUST BE REFLECTED IN OUTPUT) ---\n"
-            f"{checks_section}\n"
-            "Exclude README/repo setup requirements.\n"
-            "Include all imports required for app functionality.\n\n"
-            "--- ATTACHMENT HANDLING ---\n"
-            "At runtime, load attachments from data.json in repo root, formatted as:\n"
-            f"{sample_data_json}\n"
-            f"Attachments to process:\n{att_preview}\n\n"
-            "--- MODES OF OPERATION ---\n"
-            "Support BOTH modes:\n"
-            "1. Development: 'python app.py' starts the Flask (if required) server on any standard port for dynamic serving.\n"
-            f"2. Static Export: 'python app.py --export' generates all site pages, decoded attachments, CSS/JS/images, etc. in '{output_dir}/' for offline viewing. Script completes without user interaction.\n"
-            "    - If Flask is used, always render templates/routes via Flask (not raw Jinja) before saving HTML to output_dir in export mode.\n"
-            "    - Ensure exported HTML only contains evaluated content—no Jinja tags visible to users.\n\n"
-            "--- SPECIFIC INSTRUCTIONS ---\n"
-            "1. Parse data.json; decode all Data URIs at runtime. Do NOT hardcode attachments/sample data.\n"
-            "2. Use attachments exactly as required in brief and functional checks.\n"
-            "3. In export mode, save ALL output/binary/static files to output_dir and properly link/image/reference in HTML.\n"
-            "4. Export CSS inline or as a separate file in output_dir for proper rendering.\n"
-            "5. All exported files must reside in output_dir and be referenced correctly from HTML/pages.\n"
-            "6. Static GitHub Pages export MUST be fully self-contained and directly validate every functional requirement (no external links, redirects, or missing data).\n"
-            "7. Always use standard Python 3 indentation (4 spaces per level) and guarantee no syntax/indentation errors.\n"
-            "8. When writing Python strings containing HTML, CSS, or JS for .format(), always escape literal curly braces as double braces ({{ and }}), except for format placeholders.\n"
-            "9. Never include links or redirects outside exported static site for feature access or inspection in GitHub Pages.\n"
-            "10. Strictly render all template logic before export—do NOT save raw templates with Jinja tags to output_dir.\n"
-            "11. Do NOT display the words 'static export', 'exported', '--export', 'development mode', or other workflow/internal process keywords anywhere on the rendered pages, headings, or user-facing site text.\n"
-            "12. All visible content must reflect only the required outputs, features, data, and UX as described in the BRIEF and functional checks. Hide all implementation details from users.\n"
-            "13. - During '--export' mode, always wrap all template rendering (render_template, render_template_string) in 'with app.app_context():' \n"
-            "14. All Jinja template expressions must use only valid Jinja2 syntax—never put colons (:) inside {{ ... }}. For default values, use {{ var or 'default' }} instead of {{ var:default }}.\n"
-            "15. Ensure all template files render without any Jinja TemplateSyntaxError in Flask.\n"
-            "16. **Important** : Strictly use the brief/checks to define all visible content, features, and UX.\n\n"
-            "--- OUTPUT REQUIREMENT ---\n"
-            "Output ONLY the full code for app.py—no markdown, code fences, sample input/output, or explanations. All code must be fully runnable and free of syntax/indentation errors."
-        )
-
-    else:
-        prompt = (
-            "TASK: Update ONLY the feature logic in app.py below based on the revised brief and functional checks for round 2.\n"
-            "Keep ALL other code—structure, attachments/data.json handling, export/static/dual-mode routines, and file naming—exactly as-is.\n"
-            "Change or add ONLY the code necessary to fulfill the new logic/routes/output per the updated requirements.\n"
-            "Do NOT modify headers, comments, initialization, dual-mode switches, export routines, or static file patterns unless mandated by the new brief/checks.\n"
-            "If using Flask, retain all existing routing/app setup and update only route logic as required.\n"
-            "Preserve all import statements, file IO, and static export mechanisms unless core logic changes require updates.\n"
-            "All code must use standard Python 3 indentation (4 spaces per level, no tabs), be free of syntax/indentation errors, and be ready to run without modification.\n\n"
-            "--ROUND 2 BRIEF--\n"
-            f"{brief}\n\n"
-            "--- UPDATED FUNCTIONAL REQUIREMENTS ---\n"
-            f"{checks_section}\n"
-            "All new requirements must be reflected in app logic, view output, or site content as needed.\n"
-            "Preserve dependencies, attachment decoding, and dual-mode support from previous version.\n\n"
-            "--PREVIOUS APP.PY CODE (START)--\n"
-            f"{app_code}\n"
-            "--PREVIOUS APP.PY CODE (END)--\n\n"
-            "--- OUTPUT REQUIREMENT ---\n"
-            "Output ONLY the new, full code for app.py (with core logic updated for round 2, all else untouched). Do NOT include markdown, code fences, or explanations. Output must be fully runnable and free of syntax/indentation errors."
-        )
-
-    return llm_generate_file(prompt)
-
-
-def generate_workflow(brief, code, attachments=None, checks=None, output_dir="output"):
-    """
-    Generates prompt for GitHub Actions workflow that exports Flask app as static site.
-    """
-    attachments = attachments or []
-    checks = checks or []
-
-    checks_section = "\n".join(
-        f"- {chk}" for chk in checks) or "- None specified."
-    att_names = "\n".join(
-        f"- {att['name']}" for att in attachments) or "- None provided."
-
-    prompt = (
-        f"TASK: Generate a GitHub Actions workflow YAML (deploy.yml) to export and deploy the Flask app below as a static site to GitHub Pages.\n\n"
-        "-- ORIGINAL APP BRIEF --\n"
-        f"{brief}\n\n"
-        "--- FUNCTIONAL REQUIREMENTS ---\n"
-        f"{checks_section}\n\n"
-        "--- REFERENCE APP CODE ---\n"
-        "Use the following app.py code as the definitive reference for runtime, environment, dependencies, data handling, commands, and output structure:\n"
-        "----- BEGIN app.py -----\n"
-        f"{code}\n"
-        "----- END app.py -----\n\n"
-        "--- CRITICAL WORKFLOW REQUIREMENTS ---\n"
-        "1. The workflow must ONLY be triggered by either:\n"
-        "    - A push to the main branch where 'app.py' was changed (created, updated, or deleted)\n"
-        "    - A manual workflow dispatch event (workflow_dispatch)\n"
-        "2. Do not trigger for changes to other files.\n"
-        "3. Set up Python 3.11+ environment as required by the code\n"
-        "4. Install all dependencies from requirements.txt (must include flask and any others required by the reference code)\n"
-        "5. Ensure data.json exists in repo root\n"
-        f"6. **CRITICAL:** Run 'python app.py --export' as defined in the reference code to generate static files to '{output_dir}/'\n"
-        f"7. Upload ONLY the '{output_dir}/' directory using actions/upload-pages-artifact@v4. Do not use any download-pages-artifact action; only use the official upload and deploy actions.\n"
-        "8. Deploy using actions/deploy-pages@v4 in a separate job\n"
-        "9. Set permissions: contents: read, pages: write, id-token: write\n"
-        "10. Use concurrency group 'pages'\n"
-        "11. Use TWO jobs: 'build' (export static files) and 'deploy' (deploy to pages)\n"
-        "12. **SECURITY CHECK:** The first build step must scan the entire repo for secrets using Gitleaks (zricethezav/gitleaks-action@v2 or latest). If secrets are found, fail the build and do not deploy.\n\n"
-        "--- EXACT STRUCTURE ---\n"
-        "Job 1 'build':\n"
-        "  - Checkout code (actions/checkout@v4)\n"
-        "  - Setup Python 3.11 (actions/setup-python@v4)\n"
-        "  - Run Gitleaks scan\n"
-        "  - Install requirements (must match those in reference app.py)\n"
-        "  - Verify data.json exists\n"
-        "  - Run: python app.py --export\n"
-        f"  - Upload '{output_dir}/' directory using actions/upload-pages-artifact@v4\n\n"
-        "Job 2 'deploy':\n"
-        "  - Needs: build\n"
-        "  - Environment: github-pages\n"
-        "  - Uses: actions/deploy-pages@v4\n\n"
-        "--- OUTPUT FORMAT ---\n"
-        "Output ONLY valid YAML for .github/workflows/deploy.yml.\n"
-        "Use only: actions/checkout@v4, actions/setup-python@v4, actions/upload-pages-artifact@v4, actions/deploy-pages@v4.\n"
-        "Do not use any download-pages-artifact step—GitHub deploy-pages will use the uploaded artifact automatically.\n"
-        "Reference only the code and requirements shown above. No markdown fences, no explanations: produce pure YAML only."
-    )
-
-    # prompt = (
-    #     f"TASK: Generate a GitHub Actions workflow YAML (deploy.yml) to export and deploy the Flask app below as a static site to GitHub Pages.\n\n"
-    #     "-- ORIGINAL APP BRIEF --\n"
-    #     f"{brief}\n\n"
-    #     "--- FUNCTIONAL REQUIREMENTS ---\n"
-    #     f"{checks_section}\n\n"
-    #     "--- REFERENCE APP CODE ---\n"
-    #     "Use the following app.py code as the definitive reference for runtime, environment, dependencies, data handling, commands, and output structure:\n"
-    #     "----- BEGIN app.py -----\n"
-    #     f"{code}\n"
-    #     "----- END app.py -----\n\n"
-    #     "--- CRITICAL WORKFLOW REQUIREMENTS ---\n"
-    #     "1. The workflow must ONLY be triggered by either:\n"
-    #     "    - A push to the main branch where 'app.py' was changed (created, updated, or deleted)\n"
-    #     "    - A manual workflow dispatch event (workflow_dispatch)\n"
-    #     "2. Do not trigger for changes to other files.\n"
-    #     "3. Set up Python 3.11+ environment as required by the code\n"
-    #     "4. Install all dependencies from requirements.txt (must include flask and any others required by the reference code)\n"
-    #     "5. Ensure data.json exists in repo root\n"
-    #     f"6. **CRITICAL:** Run 'python app.py --export' as defined in the reference code to generate static files to '{output_dir}/'\n"
-    #     f"7. Upload ONLY the '{output_dir}/' directory using actions/upload-pages-artifact@v4\n"
-    #     "8. Deploy using actions/deploy-pages@v4 in a separate job\n"
-    #     "9. Set permissions: contents: read, pages: write, id-token: write\n"
-    #     "10. Use concurrency group 'pages'\n"
-    #     "11. Use TWO jobs: 'build' (export static files) and 'deploy' (deploy to pages)\n"
-    #     "12. **SECURITY CHECK:** The first build step must scan the entire repo for secrets using Gitleaks (zricethezav/gitleaks-action@v2 or latest). If secrets are found, fail the build and do not deploy.\n\n"
-    #     "--- EXACT STRUCTURE ---\n"
-    #     "Job 1 'build':\n"
-    #     "  - Checkout code\n"
-    #     "  - Setup Python 3.11\n"
-    #     "  - Run Gitleaks scan\n"
-    #     "  - Install requirements (must match those referenced in app.py)\n"
-    #     "  - Verify data.json exists\n"
-    #     "  - Run: python app.py --export\n"
-    #     f"  - Upload '{output_dir}/' directory using actions/upload-pages-artifact@v4\n\n"
-    #     "Job 2 'deploy':\n"
-    #     "  - Needs: build\n"
-    #     "  - Environment: github-pages\n"
-    #     "  - Uses: actions/deploy-pages@v4\n\n"
-    #     "--- OUTPUT FORMAT ---\n"
-    #     "Output ONLY valid YAML for .github/workflows/deploy.yml.\n"
-    #     "Use: checkout@v4, setup-python@v4, upload-pages-artifact@v4, deploy-pages@v4, and reference only the code and requirements shown above. No markdown fences, no explanations: produce pure YAML only."
-    # )
-
-    # prompt = (
-    #     f"TASK: Generate a GitHub Actions workflow YAML (deploy.yml) to export and deploy the Flask app below as a static site to GitHub Pages.\n\n"
-    #     "-- ORIGINAL APP BRIEF --\n"
-    #     f"{brief}\n\n"
-    #     "--- FUNCTIONAL REQUIREMENTS ---\n"
-    #     f"{checks_section}\n\n"
-    #     "--- REFERENCE APP CODE ---\n"
-    #     "Use the following app.py code as the definitive reference for runtime, environment, dependencies, data handling, commands, and output structure:\n"
-    #     "----- BEGIN app.py -----\n"
-    #     f"{code}\n"
-    #     "----- END app.py -----\n\n"
-    #     "--- CRITICAL WORKFLOW REQUIREMENTS ---\n"
-    #     "1. Trigger on push to main branch and on manual dispatch\n"
-    #     "2. Set up Python 3.11+ environment as required by the code\n"
-    #     "3. Install all dependencies from requirements.txt (must include flask and any others required by the reference code)\n"
-    #     "4. Ensure data.json exists in repo root\n"
-    #     f"5. **CRITICAL:** Run 'python app.py --export' as defined in the reference code to generate static files to '{output_dir}/'\n"
-    #     f"6. Upload ONLY the '{output_dir}/' directory using actions/upload-pages-artifact@v4\n"
-    #     "7. Deploy using actions/deploy-pages@v4 in a separate job\n"
-    #     "8. Set permissions: contents: read, pages: write, id-token: write\n"
-    #     "9. Use concurrency group 'pages'\n"
-    #     "10. Use TWO jobs: 'build' (export static files) and 'deploy' (deploy to pages)\n"
-    #     "11. **SECURITY CHECK:** The first build step must scan the entire repo for secrets using Gitleaks (zricethezav/gitleaks-action@v2 or latest). If secrets are found, fail the build and do not deploy.\n\n"
-    #     "--- EXACT STRUCTURE ---\n"
-    #     "Job 1 'build':\n"
-    #     "  - Checkout code\n"
-    #     "  - Setup Python 3.11\n"
-    #     "  - Run Gitleaks scan\n"
-    #     "  - Install requirements (must match those referenced in app.py)\n"
-    #     "  - Verify data.json exists\n"
-    #     "  - Run: python app.py --export\n"
-    #     f"  - Upload '{output_dir}/' directory using actions/upload-pages-artifact@v4\n\n"
-    #     "Job 2 'deploy':\n"
-    #     "  - Needs: build\n"
-    #     "  - Environment: github-pages\n"
-    #     "  - Uses: actions/deploy-pages@v4\n\n"
-    #     "--- OUTPUT FORMAT ---\n"
-    #     "Output ONLY valid YAML for .github/workflows/deploy.yml.\n"
-    #     "Use: checkout@v4, setup-python@v4, upload-pages-artifact@v4, deploy-pages@v4, and reference only the code and requirements shown above. No markdown fences, no explanations: produce pure YAML only."
-    # )
-
-    # prompt = (
-    #     f"TASK: Generate a GitHub Actions workflow YAML to export Flask app as static site and deploy to GitHub Pages.\n\n"
-    #     "--- ORIGINAL APP BRIEF ---\n"
-    #     f"{brief}\n\n"
-    #     "--- FUNCTIONAL REQUIREMENTS ---\n"
-    #     f"{checks_section}\n\n"
-    #     "--- APP CODE CONTEXT ---\n"
-    #     f"The app is a Flask Python script (app.py) that:\n"
-    #     f"- Can run as a development server: python app.py\n"
-    #     f"- Can export static files: python app.py --export\n"
-    #     f"- Reads data from data.json in repo root\n"
-    #     f"- Processes attachments: {att_names}\n"
-    #     f"- Exports static site to '{output_dir}/' directory when run with --export flag\n\n"
-    #     "--- CRITICAL WORKFLOW REQUIREMENTS ---\n"
-    #     "1. Trigger on push to main branch and allow manual dispatch\n"
-    #     "2. Set up Python 3.11+ environment\n"
-    #     "3. Install dependencies from requirements.txt (must include flask)\n"
-    #     "4. Ensure data.json exists in repo root\n"
-    #     f"5. **CRITICAL**: Run 'python app.py --export' to generate static files in '{output_dir}/'\n"
-    #     f"6. Upload ONLY the '{output_dir}/' directory using actions/upload-pages-artifact@v4\n"
-    #     "7. Deploy using actions/deploy-pages@v4 in separate job\n"
-    #     "8. Set permissions: contents: read, pages: write, id-token: write\n"
-    #     "9. Use concurrency group 'pages'\n"
-    #     "10. Use TWO jobs: 'build' (export static files) and 'deploy' (deploy to pages)\n"
-    #     "11. **SECURITY CHECK:** The first job step MUST scan the entire repository for secrets using Gitleaks (zricethezav/gitleaks-action@v2 or latest). If gitleaks finds issues, fail the build and do not proceed to deploy.\n\n"
-    #     "--- EXACT STRUCTURE ---\n"
-    #     "Job 1 'build':\n"
-    #     "  - Checkout code\n"
-    #     "  - Setup Python 3.11\n"
-    #     "  - Run gitleak scans\n"
-    #     "  - Install requirements (flask must be included)\n"
-    #     "  - Verify data.json exists\n"
-    #     "  - Run: python app.py --export\n"
-    #     f"  - Upload '{output_dir}/' with actions/upload-pages-artifact@v4\n\n"
-    #     "Job 2 'deploy':\n"
-    #     "  - Needs: build\n"
-    #     "  - Environment: github-pages\n"
-    #     "  - Uses: actions/deploy-pages@v4\n\n"
-    #     "--- OUTPUT FORMAT ---\n"
-    #     "Generate ONLY valid YAML for .github/workflows/deploy.yml\n"
-    #     "Use: checkout@v4, setup-python@v4, upload-pages-artifact@v4, deploy-pages@v4\n"
-    #     "No markdown fences, no explanations, pure YAML only."
-    # )
-
-    return llm_generate_file(prompt)
-
-
-def generate_readme(repo_name, brief, round_num, github_user, code):
-    # prompt = (
-    #     f"Write a rich README.md for the GitHub repo '{repo_name}'. "
-    #     "Ensure it is comprehensive and user-friendly."
-    #     f"Include: Summary ({brief}), setup instructions, usage, code explanation (for app.py, LICENSE, README.md) - {code} "
-    #     f"MIT License. Link to Pages: https://{github_user}.github.io/{repo_name}/. State it's AI-generated."
-    # )
-
-    prompt = (
-        f"Write a comprehensive, user-friendly README.md for the GitHub repository '{repo_name}'.\n\n"
-        "Use the following as your complete source of truth for code and features:\n"
-        "--- START app.py ---\n"
-        f"{code}\n"
-        "--- END app.py ---\n\n"
-        "--- PROJECT SUMMARY ---\n"
-        f"{brief}\n\n"
-        "--- SETUP INSTRUCTIONS ---\n"
-        "1. Outline all prerequisites required by the code, including Python version and external dependencies.\n"
-        "2. Provide steps for installing requirements and running the app (include any data.json preparation as seen in code).\n"
-        "3. Give instructions for both development (dynamic) and static export modes, and describe the --export flag if used.\n"
-        "--- USAGE GUIDE ---\n"
-        "Describe how to run the app, use its options/flags, and where the exported files will appear according to the real code provided.\n\n"
-        "--- CODE EXPLANATION ---\n"
-        "Explain the logical structure of app.py based on the code above—major components, data flow, file handling, and any non-obvious routines.\n"
-        "- Summarize the LICENSE and how it applies to this code.\n"
-        "- For README.md, state that it is AI-generated for transparency.\n\n"
-        "--- LICENSE ---\n"
-        "MIT License (brief summary of permissions and limitations).\n\n"
-        "--- LIVE DEMO LINK ---\n"
-        f"[GitHub Pages live site](https://{github_user}.github.io/{repo_name}/)\n\n"
-        "--- AI GENERATION NOTICE ---\n"
-        "End by stating that this README and the code were generated with an AI tool."
-    )
-
-    logger.info("Generating README.md...")
-    return llm_generate_file(prompt)
-
-
-def generate_requirements(code):
-    prompt = (
-        f"For the attached code snippet, please gather and provide the requirements.txt content - {code}"
-        "Do not include built-in Python modules."
-        "List each package name and the required version (if known); otherwise, latest is fine."
-        "Output requirements.txt as plain text only—do not use code fences, markdown, or add any explanations."
-    )
-    logger.info("Generating Requirements.txt")
-    return llm_generate_file(prompt)
-
-
-def generate_license():
-    prompt = (
-        "Based on FUNCTIONAL REQUIREMENTS & CHECK about license in the previous chat, create a license file."
-        " If no license check mentioned, create MIT license as default"
-        "Output license  as plain text only—do not use code fences, markdown, or add any explanations."
-    )
-    logger.info("Generating LICENSE")
-    return llm_generate_file(prompt)
-
-
-def get_run_id_for_commit(owner, repo, commit_sha, token, workflow_filename=None):
-    """Finds the GitHub Actions run ID for a specific commit."""
-    # This URL filters runs by the triggering commit
-    url = f"https://api.github.com/repos/{owner}/{repo}/actions/runs"
-    headers = {"Authorization": f"Bearer {token}",
-               "Accept": "application/vnd.github+json"}
-    params = {"head_sha": commit_sha}
-
-    logger.info(
-        f"Searching for workflow run matching commit SHA: {commit_sha[:7]}")
-
-    # Retry a few times in case the run hasn't been created yet
-    for _ in range(5):
-        try:
-            resp = requests.get(url, headers=headers, params=params)
-            resp.raise_for_status()
-            runs = resp.json().get("workflow_runs", [])
-
-            if runs:
-                # If a workflow filename is provided, find the exact match
-                if workflow_filename:
-                    for run in runs:
-                        if run['path'].endswith(workflow_filename):
-                            logger.info(
-                                f"Found run ID {run['id']} for workflow file '{workflow_filename}'.")
-                            return run['id']
-                else:
-                    # Otherwise, assume the first one is the correct one
-                    run_id = runs[0]['id']
-                    workflow_name = runs[0]['name']
-                    logger.info(
-                        f"Found run ID {run_id} for workflow '{workflow_name}'.")
-                    return run_id
-
-            logger.info("Run not found yet, retrying in 5 seconds...")
-            time.sleep(5)
-
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP Error finding run ID: {e} - {e.response.text}")
-            return None
-
-    logger.error("Could not find a workflow run for the specified commit.")
-    return None
-
-
-def wait_for_actions_run(owner, repo, commit_sha, token, workflow_filename=None, timeout=180):
-    """Dynamically finds and waits for a GitHub Actions run to complete."""
-
-    run_id = get_run_id_for_commit(
-        owner, repo, commit_sha, token, workflow_filename)
-    if not run_id:
-        return False
-
-    url = f"https://api.github.com/repos/{owner}/{repo}/actions/runs/{run_id}"
-    headers = {"Authorization": f"Bearer {token}",
-               "Accept": "application/vnd.github+json"}
-    start_time = time.time()
-
-    logger.info(f"Polling status for Run ID: {run_id}")
-    while time.time() - start_time < timeout:
-        try:
-            resp = requests.get(url, headers=headers)
-            resp.raise_for_status()
-            run_data = resp.json()
-
-            status = run_data.get("status")
-            conclusion = run_data.get("conclusion")
-
-            if status == "completed":
-                logger.info(
-                    f"Workflow completed with conclusion: {conclusion}")
-                return conclusion == "success"
-
-            logger.info(
-                f"Workflow is still running (Status: {status})... waiting 10s.")
-            time.sleep(10)
-
-        except requests.exceptions.HTTPError as e:
-            logger.error(
-                f"HTTP Error polling run status: {e} - {e.response.text}")
-            return False
-        except Exception as e:
-            logger.error(f"An unexpected error occurred: {e}")
-            time.sleep(10)
-
-    logger.warning("Timed out waiting for workflow run to complete.")
-    return False
-
-
-def ensure_pages_enabled(owner, repo_name, token, max_retries=5):
-    """
-    Enable GitHub Pages with GitHub Actions as the source.
-    Retries if needed to handle API delays.
-    """
-    url = f"https://api.github.com/repos/{owner}/{repo_name}/pages"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28"
-    }
-
-    # Check if Pages already exists
-    resp = requests.get(url, headers=headers)
-    logger.info(f"GET Pages status: {resp.status_code}")
-
-    if resp.status_code == 200:
-        pages_info = resp.json()
-        logger.info(
-            f"Pages already enabled. Source: {pages_info.get('source')}")
-        return True
-
-    if resp.status_code == 404:
-        # Pages not enabled - create it with GitHub Actions source
-        logger.info("Enabling GitHub Pages with GitHub Actions source...")
-
-        payload = {
-            "source": {
-                "branch": "main",
-                "path": "/"
-            },
-            "build_type": "workflow"  # This enables GitHub Actions deployment
-        }
-
-        for attempt in range(max_retries):
-            resp = requests.post(url, headers=headers, json=payload)
-            logger.info(
-                f"POST Pages (attempt {attempt + 1}): {resp.status_code} - {resp.text[:200]}")
-
-            if resp.status_code in [201, 200]:
-                logger.info(
-                    "✓ GitHub Pages enabled successfully with workflow source")
-                time.sleep(5)  # Give GitHub time to process
-                return True
-            elif resp.status_code == 409:
-                logger.info("Pages creation in progress, waiting...")
-                time.sleep(3)
-            else:
-                logger.warning(f"Unexpected response: {resp.status_code}")
-                time.sleep(2)
-
-        logger.error("Failed to enable GitHub Pages after retries")
-        return False
-
-    logger.warning(f"Unexpected GET response: {resp.status_code}")
-    return False
-
-
-def process_request(req):
-    try:
-        logger.info(
-            f"Processing new request for task '{req.get('task')}', round {req.get('round')}")
-        email = req["email"]
-        task = req["task"]
-        round_num = req["round"]
-        nonce = req["nonce"]
-        brief = req["brief"]
-        attachments = req.get("attachments", [])
-        checks = req.get("checks", [])
-        evaluation_url = req["evaluation_url"]
-        # repo_id = str(uuid.uuid4()).split("-")[0]
-        # repo_name = f"{task}-{repo_id}" if round_num == 1 else req.get("repo_name")
-        user = gh.get_user()
-        repo_name = get_repo_name_from_task(task)
-        commit_sha = None
-
-        try:
-            # Try to find the repo created in a previous round.
-            repo = user.get_repo(repo_name)
-            logger.info(f"Found existing repo for task: {repo_name}")
-        except UnknownObjectException:
-            logger.info(f"No existing repo found for task: {repo_name}")
-            logger.info(f"Creating new repo for task: {repo_name}")
-            repo = user.create_repo(repo_name, private=False)
-            # If it's not found, this MUST be Round 1. Create it.
-
-        repo_url = repo.html_url
-        pages_url = f"https://{GITHUB_USER}.github.io/{repo_name}/"
-        workflow_path = ".github/workflows/deploy.yml"
-
-        if round_num == 1:
-            context_to_save = {
-                "brief_history": [brief],
-                "checks_history": checks,
-                "attachment_history": attachments
-            }
-
-            context_content = json.dumps(context_to_save, indent=2)
-            attachments_content = json.dumps(
-                {"attachments": attachments}, indent=2)
-
-            previous_code = None
-            logger.info(
-                "Step 1/8: Generating code file with export capability")
-            code = generate_code(brief, previous_code,
-                                 attachments, round_num, checks)
-
-            logger.info("Step 2/8: Generating README.md")
-            readme = generate_readme(
-                repo_name, brief, round_num, GITHUB_USER, code)
-
-            logger.info("Step 3/8: Generating requirements.txt")
-            req_txt = generate_requirements(code)
-            # Ensure Flask is included
-            if "flask" not in req_txt.lower():
-                req_txt = "flask\n" + req_txt
-
-            logger.info("Step 4/8: Generating LICENSE")
-            license_content = generate_license()
-
-            logger.info("Step 5/8: Generating workflow YAML")
-            workflow_content = generate_workflow(
-                brief, code, attachments, checks, output_dir="output")
-
-            # CRITICAL: Enable Pages BEFORE creating any files
-            logger.info("Step 6/8: Enabling GitHub Pages with Actions source")
-            pages_enabled = ensure_pages_enabled(
-                GITHUB_USER, repo_name, GITHUB_TOKEN)
-            if not pages_enabled:
-                logger.warning("Failed to enable Pages, but continuing...")
-
-            logger.info("Step 7/8: Creating repo files")
-
-            upsert_github_file(repo, "data.json",
-                               attachments_content, "Add attachments data")
-            # upsert_github_file(repo, "app.py", code,
-            #                    "Initial Flask app with export")
-            upsert_github_file(repo, "requirements.txt",
-                               req_txt, "Add dependencies")
-            upsert_github_file(repo, "LICENSE", license_content, "Add license")
-            upsert_github_file(repo, "README.md", readme, "Add README")
-            upsert_github_file(repo, "context.json",
-                               context_content, "Add context")
-            upsert_github_file(
-                repo, workflow_path, workflow_content, "Add Pages deployment workflow")
-            time.sleep(5)  #
-            result = upsert_github_file(repo, "app.py", code,
-                                        "Initial Flask app with export")
-            # repo.create_file(
-            #     "data.json", "Add attachments data", attachments_content)
-            # repo.create_file("app.py", "Initial Flask app with export", code)
-            # repo.create_file("requirements.txt", "Add dependencies", req_txt)
-            # repo.create_file("LICENSE", "Add license", license_content)
-            # repo.create_file("README.md", "Add README", readme)
-            # repo.create_file("context.json", "Add context", context_content)
-            # result = repo.create_file(
-            #     workflow_path, "Add Pages deployment workflow", workflow_content)
-            if result is not None:
-                commit_sha = result["commit"].sha
-            else:
-                commit_sha = repo.get_commits()[0].sha
-        else:
-            # Update existing repo for subsequent rounds
-            logger.info(
-                f"Updating existing repo files for round - {round_num}")
-
-            try:
-                context_file = repo.get_contents("context.json")
-                previous_code = repo.get_contents(
-                    "app.py").decoded_content.decode("utf-8")
-                past_context = json.loads(
-                    context_file.decoded_content.decode())
-
-                existing_attachments = {
-                    (att['name'], att['url']) for att in past_context.get("attachment_history", [])}
-                for attachment in attachments:
-                    if (attachment['name'], attachment['url']) not in existing_attachments:
-                        past_context.setdefault(
-                            "attachment_history", []).append(attachment)
-                        logger.info(
-                            f"Appended new attachment: '{attachment['name']}'")
-
-                if brief not in past_context["brief_history"]:
-                    past_context["brief_history"].append(brief)
-
-                brief = "This is a cumulative brief...\n" + \
-                    "\n".join(past_context["brief_history"])
-                checks = past_context["checks_history"]
-                full_attachments = past_context.get(
-                    "attachment_history", attachments)
-            except UnknownObjectException:
-                logger.warning(
-                    "context.json not found. Using current request's data only.")
-                past_context = None
-                previous_code = None
-                full_attachments = attachments
-            except Exception as e:
-                logger.error(
-                    f"Error loading context.json: {e}. Using current request's data only.")
-                past_context = None
-                previous_code = None
-                full_attachments = attachments
-
-            if past_context:
-                context_content = json.dumps(past_context, indent=2)
-                repo.update_file("context.json", f"Update context for round {round_num}",
-                                 context_content, context_file.sha)
-
-            # Update attachments
-            attachments_content = json.dumps(
-                {"attachments": full_attachments}, indent=2)
-
-            logger.info("Step 1/4: Generating code for update")
-            logging.info("Using previous code length: %d", len(
-                previous_code) if previous_code else 0)
-            code = generate_code(brief, previous_code,
-                                 full_attachments, round_num, checks)
-            logger.info("Step 2/4: Generating README.md for update")
-            readme = generate_readme(
-                repo_name, brief, round_num, GITHUB_USER, code)
-            logger.info("Step 3/4: Generating workflow for update")
-            workflow_content = generate_workflow(
-                brief, code, full_attachments, checks, output_dir="output")
-
-            logger.info("Step 4/4: Generating requirements.txt for update")
-            req_txt = generate_requirements(code)
-
-            upsert_github_file(repo, "data.json",
-                               attachments_content, "Add attachments data for round {round_num}")
-            upsert_github_file(repo, "requirements.txt",
-                               req_txt, f"Update for round {round_num}")
-            upsert_github_file(repo, "README.md", readme,
-                               f"Update README for round {round_num}")
-            upsert_github_file(
-                repo, workflow_path, workflow_content, f"Update workflow for round {round_num}")
-            time.sleep(5)  #
-            result = upsert_github_file(repo, "app.py", code,
-                                        f"Update for round {round_num}")
-            # repo.update_file(
-            #     "data.json", f"Add attachments data for round {round_num}", attachments_content,
-            #                  repo.get_contents("data.json").sha)
-            # repo.update_file("app.py", f"Update for round {round_num}", code,
-            #                  repo.get_contents("app.py").sha)
-            # repo.update_file("requirements.txt", f"Update for round {round_num}", req_txt,
-            #                  repo.get_contents("requirements.txt").sha)
-            # repo.update_file("README.md", f"Update README for round {round_num}", readme,
-            #                  repo.get_contents("README.md").sha)
-            # result = repo.update_file(workflow_path, f"Update workflow for round {round_num}",
-            #                           workflow_content, repo.get_contents(workflow_path).sha)
-            if result is not None:
-                commit_sha = result["commit"].sha
-            else:
-                commit_sha = repo.get_commits()[0].sha
-
-        logger.info("Step: Waiting for workflow to complete")
-        actions_success = wait_for_actions_run(
-            GITHUB_USER, repo_name, commit_sha, GITHUB_TOKEN,
-            workflow_filename="deploy.yml",
-            timeout=180  # 3 minutes
-        )
-
-        if actions_success:
-            logger.info("✓ Workflow completed successfully")
-        else:
-            logger.warning("⚠ Workflow did not complete successfully")
-
-        logger.info("Notifying evaluation endpoint")
-        eval_payload = {
-            "email": email, "task": task, "round": round_num, "nonce": nonce,
-            "repo_url": repo_url, "commit_sha": commit_sha,
-            "pages_url": pages_url,
-        }
-
-        # Retry logic for evaluation notification
-        delay = 1
-        for attempt in range(6):
-            logger.info(f"Sending evaluation, attempt {attempt+1}")
-            resp = requests.post(evaluation_url, json=eval_payload,
-                                 headers={"Content-Type": "application/json"})
-            if resp.status_code == 200:
-                logger.info("✓ Evaluation notification sent")
-                break
-            time.sleep(delay)
-            delay *= 2
-
-        logger.info(f"✓ Process complete for {task} round {round_num}")
-
-    except Exception as ex:
-        logger.error(f"process_request error: {ex}", exc_info=True)
-
-
-def ensure_pages_site(owner, repo_name, branch, token, path="/"):
-    """
-    Robustly create or update a GitHub Pages site.
-    Tries GET; if 404, uses POST to create; if 200, uses PUT to update.
-    """
-    url = f"https://api.github.com/repos/{owner}/{repo_name}/pages"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json"
-    }
-    # 1. Check if Pages site exists
-    resp = requests.get(url, headers=headers)
-    logger.info(f"GET Pages site: {resp.status_code} - {resp.text}")
-    if resp.status_code == 404:
-        # Create Pages site (POST)
-        logger.info("Pages site not found, creating...")
-        resp = requests.post(url, headers=headers, json={
-            "source": {"branch": branch, "path": path}
-        })
-        logger.info(f"POST Pages site: {resp.status_code} - {resp.text}")
-        time.sleep(3)  # Give GitHub time to initialize
-    elif resp.status_code == 200:
-        # Update source branch/path (PUT)
-        logger.info("Pages site exists, updating source branch/path...")
-        resp = requests.put(url, headers=headers, json={
-            "source": {"branch": branch, "path": path}
-        })
-        logger.info(f"PUT Pages site: {resp.status_code} - {resp.text}")
-    else:
-        logger.warning(
-            f"Unexpected GET response: {resp.status_code} - {resp.text}")
-    try:
-        result = resp.json()
+        req = request.get_json()
+        if not req:
+            return jsonify(error="Invalid JSON"), 400
     except Exception:
-        result = resp.text
-    return resp.status_code, result
+        return jsonify(error="Invalid JSON"), 400
 
-
-# @app.route("/api-endpoint", methods=["POST"])
-# def api_endpoint():
-#     logger.info("API endpoint called.")
-#     req = request.get_json()
-#     if req.get("secret") != GOOGLE_FORM_SECRET:
-#         logger.warning("Invalid secret provided.")
-#         return jsonify({"error": "Invalid secret"}), 403
-#     threading.Thread(target=process_request, args=(req,)).start()
-#     logger.info("Request acknowledged and processing in background thread.")
-#     return jsonify({"status": "acknowledged"}), 200
-
-# In your Flask endpoint, put the request in the queue instead of spawning a thread directly:
-@app.route("/api-endpoint", methods=["POST"])
-def api_endpoint():
-    logger.info("API endpoint called.")
-    req = request.get_json()
     if req.get("secret") != GOOGLE_FORM_SECRET:
         logger.warning("Invalid secret provided.")
         return jsonify(error="Invalid secret"), 403
-    task_queue.put(req)  # Add request to the queue
-    logger.info("Request acknowledged and queued for background processing.")
-    return jsonify(status="acknowledged"), 200
+
+    required = ("email", "url", "secret")
+    if any(k not in req for k in required):
+        return jsonify(error="Missing required fields"), 400
+
+    try:
+        # Put task onto the queue immediately
+        task_queue.put(req, block=False)
+        logger.info(f"Request acknowledged and queued for email={req['email']}.")
+        
+        # Immediate response: 200 Acknowledged
+        return jsonify(
+            status="acknowledged",
+            message="Quiz solving started in background worker. Check 'generated_solver_temp.py' for the last executed script."
+        ), 200
+    except Exception:
+        logger.error("Task queue is full; cannot accept more requests right now.")
+        return jsonify(error="Server busy"), 503
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "healthy"}), 200
 
 
 @app.route("/", methods=["GET"])
-def home():
-    logger.info("Health check: home endpoint.")
-    return "API is running!", 200
+def index():
+    return jsonify({
+        "service": "AIPipe LLM-driven Quiz Solver (async)",
+        "status": "running"
+    }), 200
 
 
 if __name__ == "__main__":
+    # port = int(os.environ.get("PORT", 7860))
+    # logger.info(f"Starting server on port {port}")
+    # app.run(host="0.0.0.0", port=port, debug=False, threaded=False)
     logger.info("Starting Flask server on port 7860...")
     app.run(host="0.0.0.0", port=7860)
