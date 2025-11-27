@@ -17,7 +17,6 @@ import requests
 # CONFIG & LOGGING
 # =========================
 
-# Test config
 
 logging.basicConfig(
     format='[%(asctime)s][%(levelname)s] %(message)s',
@@ -1144,8 +1143,5 @@ def index():
 
 
 if __name__ == "__main__":
-    # port = int(os.environ.get("PORT", 7860))
-    # logger.info(f"Starting server on port {port}")
-    # app.run(host="0.0.0.0", port=port, debug=False, threaded=False)
     logger.info("Starting Flask server on port 7860...")
     app.run(host="0.0.0.0", port=7860)
