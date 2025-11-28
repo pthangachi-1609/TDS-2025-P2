@@ -17,6 +17,7 @@ import requests
 # CONFIG & LOGGING
 # =========================
 
+# Test config
 
 logging.basicConfig(
     format='[%(asctime)s][%(levelname)s] %(message)s',
@@ -355,6 +356,17 @@ CRITICAL:
 - If writing code, output ONLY the code block (```python ... ```).
 - **IMPORTANT**: Always return the data output from the code block as JSON to stdout.
 - **IMPORTANT**: Convert all numpy/pandas types to native Python types (e.g., `int(result)`, `float(result)`) before printing JSON. `numpy.int64` is NOT JSON serializable.
+- **ANSWER FORMAT REQUIREMENTS**:
+  - The answer may be: **boolean**, **number**, **string**, **base64 URI** of a file, or a **JSON object** combining these
+  - For file attachments: Encode as base64 data URI (e.g., `data:image/png;base64,iVBORw0KG...`)
+  - **PAYLOAD SIZE LIMIT**: Ensure the final JSON payload is under 1MB
+  - For visualizations: If generating charts/images, convert to base64 and include in answer
+  - Example formats:
+    - Boolean: `{{"answer": true}}`
+    - Number: `{{"answer": 42}}`
+    - String: `{{"answer": "hello"}}`
+    - File: `{{"answer": "data:image/png;base64,iVBORw0KGgo..."}}`
+    - JSON object: `{{"answer": {{"count": 5, "image": "data:image/png;base64,..."}}}}`
 - **ALLOWED LIBRARIES**: You may ONLY use standard Python libraries (os, json, re, math, etc.) and the following pre-installed packages:
   - `requests`
   - `pandas`
@@ -1122,7 +1134,7 @@ def handle_quiz():
         # Immediate response: 200 Acknowledged
         return jsonify(
             status="acknowledged",
-            message="Quiz solving started in background worker. Check 'generated_solver_temp.py' for the last executed script."
+            message="Quiz solving started in background worker."
         ), 200
     except Exception:
         logger.error("Task queue is full; cannot accept more requests right now.")
